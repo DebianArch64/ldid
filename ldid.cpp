@@ -483,6 +483,10 @@ static std::streamsize read(std::streambuf &stream, void *data, size_t size) {
     return writ;
 }
 
+static inline void put(std::streambuf &stream, uint8_t value) {
+    _assert(stream.sputc(value) != EOF);
+}
+
 static inline void get(std::streambuf &stream, void *data, size_t size) {
     _assert(read(stream, data, size) == size);
 }
@@ -499,6 +503,10 @@ static inline void put(std::streambuf &stream, const void *data, size_t size, co
         total += writ;
         percent(double(total) / size);
     }
+}
+
+static inline void put(std::streambuf &stream, const std::string &data) {
+    return put(stream, data.data(), data.size());
 }
 
 static size_t most(std::streambuf &stream, void *data, size_t size) {
@@ -881,6 +889,156 @@ struct EntitlementValue
         return data.str();
     }
 };
+
+static inline unsigned bytes(uint64_t value) {
+    return (64 - __builtin_clzll(value) + 7) / 8;
+}
+
+static void put(std::streambuf &stream, uint64_t value, size_t length) {
+    length *= 8;
+    do put(stream, uint8_t(value >> (length -= 8)));
+    while (length != 0);
+}
+
+static void der(std::streambuf &stream, uint64_t value) {
+    if (value < 128)
+        put(stream, value);
+    else {
+        unsigned length(bytes(value));
+        put(stream, 0x80 | length);
+        put(stream, value, length);
+    }
+}
+
+static std::string der(uint8_t tag, const char *value, size_t length) {
+    std::stringbuf data;
+    put(data, tag);
+    der(data, length);
+    put(data, value, length);
+    return data.str();
+}
+
+static std::string der(uint8_t tag, const char *value) {
+    return der(tag, value, strlen(value)); }
+static std::string der(uint8_t tag, const std::string &value) {
+    return der(tag, value.data(), value.size()); }
+
+template <typename Type_>
+static void der_(std::stringbuf &data, const Type_ &values) {
+    size_t size(0);
+    for (const auto &value : values)
+        size += value.size();
+    der(data, size);
+    for (const auto &value : values)
+        put(data, value);
+}
+
+static std::string der(const std::vector<std::string> &values) {
+    std::stringbuf data;
+    put(data, 0x30);
+    der_(data, values);
+    return data.str();
+}
+
+static std::string der(const std::multiset<std::string> &values) {
+    std::stringbuf data;
+    put(data, 0x31);
+    der_(data, values);
+    return data.str();
+}
+
+static std::string der(const std::pair<std::string, std::string> &value) {
+    const auto key(der(0x0c, value.first));
+    std::stringbuf data;
+    put(data, 0x30);
+    der(data, key.size() + value.second.size());
+    put(data, key);
+    put(data, value.second);
+    return data.str();
+}
+
+#ifndef LDID_NOPLIST
+static std::string der(plist_t data) {
+    switch (const auto type = plist_get_node_type(data)) {
+        case PLIST_BOOLEAN: {
+            uint8_t value(0);
+            plist_get_bool_val(data, &value);
+
+            std::stringbuf data;
+            put(data, 0x01);
+            der(data, 1);
+            put(data, value != 0 ? 1 : 0);
+            return data.str();
+        } break;
+
+        case PLIST_UINT: {
+            uint64_t value;
+            plist_get_uint_val(data, &value);
+            const auto length(bytes(value));
+
+            std::stringbuf data;
+            put(data, 0x02);
+            der(data, length);
+            put(data, value, length);
+            return data.str();
+        } break;
+
+        case PLIST_REAL: {
+            _assert(false);
+        } break;
+
+        case PLIST_DATE: {
+            _assert(false);
+        } break;
+
+        case PLIST_DATA: {
+            char *value;
+            uint64_t length;
+            plist_get_data_val(data, &value, &length);
+            _scope({ free(value); });
+            return der(0x04, value, length);
+        } break;
+
+        case PLIST_STRING: {
+            char *value;
+            plist_get_string_val(data, &value);
+            _scope({ free(value); });
+            return der(0x0c, value);
+        } break;
+
+        case PLIST_ARRAY: {
+            std::vector<std::string> values;
+            for (auto e(plist_array_get_size(data)), i(decltype(e)(0)); i != e; ++i)
+                values.push_back(der(plist_array_get_item(data, i)));
+            return der(values);
+        } break;
+
+        case PLIST_DICT: {
+            std::multiset<std::string> values;
+
+            plist_dict_iter iterator(NULL);
+            plist_dict_new_iter(data, &iterator);
+            _scope({ free(iterator); });
+
+            for (;;) {
+                char *key(NULL);
+                plist_t value(NULL);
+                plist_dict_next_item(data, iterator, &key, &value);
+                if (key == NULL)
+                    break;
+                _scope({ free(key); });
+                values.insert(der(std::make_pair(key, der(value))));
+            }
+
+            return der(values);
+        } break;
+
+        default: {
+            _assert_(false, "unsupported plist type %d", type);
+        } break;
+    }
+}
+#endif
 
 struct EntitlementBlob
 {
@@ -1794,6 +1952,10 @@ static void Commit(const std::string &path, const std::string &temp) {
 
 namespace ldid {
 
+#ifndef LDID_NOPLIST
+static plist_t plist(const std::string &data);
+#endif
+
 Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::string &identifier, const std::string &entitlements, const std::string &requirement, const std::string &key, const Slots &slots, const Functor<void (double)> &percent) {
     Hash hash;
 
@@ -1901,92 +2063,17 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
             }
         }
         
-        if (!entitlements.empty())
-        {
-            std::vector<EntitlementBlob> entitlementBlobs;
-            
-            plist_t plist = NULL;
-            plist_from_xml(entitlements.data(), (uint32_t)entitlements.length(), &plist);
-            
-            plist_dict_iter it = NULL;
-            plist_dict_new_iter(plist, &it);
-            
-            char *key = NULL;
-            plist_t node = NULL;
-            plist_dict_next_item(plist, it, &key, &node);
-            
-            while (node)
-            {
-                plist_type type = plist_get_node_type(node);
-                switch (type)
-                {
-                    case PLIST_STRING:
-                    {
-                        char *value = NULL;
-                        plist_get_string_val(node, &value);
-                        
-                        EntitlementBlob blob(key, std::string(value)); // Explicitly cast value to std::string or else it will (annoyingly) call bool constructor.
-                        entitlementBlobs.push_back(blob);
-                        
-                        free(value);
-                        
-                        break;
-                    }
-                        
-                    case PLIST_BOOLEAN:
-                    {
-                        uint8_t value = 0;
-                        plist_get_bool_val(node, &value);
-                        
-                        EntitlementBlob blob(key, value != 0);
-                        entitlementBlobs.push_back(blob);
-                        break;
-                    }
-                        
-                    case PLIST_ARRAY:
-                    {
-                        std::vector<std::string> values;
-                        
-                        int size = plist_array_get_size(node);
-                        for (int i = 0; i < size; i++)
-                        {
-                            plist_t subnode = plist_array_get_item(node, i);
-                            
-                            char *value = NULL;
-                            plist_get_string_val(subnode, &value);
-                            
-                            values.push_back(value);
-                            
-                            free(value);
-                        }
-                        
-                        EntitlementBlob blob(key, values);
-                        entitlementBlobs.push_back(blob);
-                        break;
-                    }
-                        
-                    default:
-                    {
-                        printf("[ldid] Unsupported entitlement type: %d\n", type);
-                        break;
-                    }
-                }
-                
-                free(key);
-                key = NULL;
-                
-                plist_dict_next_item(plist, it, &key, &node);
-            }
-            
-            free(it);
-            plist_free(plist);
-
+        std::string derFormat;
+        std::string xmlFormat; // TODO: Support importing der entitlements and convert to xml :)
+        auto combined(plist(entitlements));
+        _scope( { plist_free(combined); } );
+        _assert(plist_get_node_type(combined) == PLIST_DICT);
+        derFormat = der(combined);
+        
+        if(!derFormat.empty()) { //MARK: CHECK IF VALID!!!!!
             std::stringbuf data;
-
-            EntitlementsSuperBlob superBlob(entitlementBlobs);
-            put(data, superBlob.data().data(), superBlob.length);
-
-            insert(blobs, CSSLOT_RAW_ENTITLEMENTS, data);
+            put(data, derFormat.data(), derFormat.size());
+            insert(blobs, CSSLOT_RAW_ENTITLEMENTS, CSMAGIC_EMBEDDED_RAW_ENTITLEMENTS, data);
         }
 
         Slots posts(slots);
@@ -2333,6 +2420,8 @@ static void copy(std::streambuf &source, std::streambuf &target, size_t length, 
 
 #ifndef LDID_NOPLIST
 static plist_t plist(const std::string &data) {
+    if(data.empty())
+        return plist_new_dict(); // fixes crashing issues...
     plist_t plist(NULL);
     if (Starts(data, "bplist00"))
         plist_from_bin(data.data(), data.size(), &plist);
