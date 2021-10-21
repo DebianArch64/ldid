@@ -239,6 +239,7 @@ struct mach_header {
 #define MH_OBJECT     0x1
 #define MH_EXECUTE    0x2
 #define MH_DYLIB      0x6
+#define MH_DYLINKER   0x7
 #define MH_BUNDLE     0x8
 #define MH_DYLIB_STUB 0x9
 
@@ -678,6 +679,7 @@ class MachHeader :
         _assert(
             Swap(mach_header_->filetype) == MH_EXECUTE ||
             Swap(mach_header_->filetype) == MH_DYLIB ||
+            Swap(mach_header_->filetype) == MH_DYLINKER ||
             Swap(mach_header_->filetype) == MH_BUNDLE
         );
     }
@@ -1040,150 +1042,6 @@ static std::string der(plist_t data) {
 }
 #endif
 
-struct EntitlementBlob
-{
-    uint8_t padding = 0x30;
-    uint8_t length; // Excludes .padding and .length
-    
-    EntitlementValue key;
-    std::vector<EntitlementValue> values = {};
-        
-    EntitlementBlob(std::string key, std::string v) : key(EntitlementValue::Type::String, key)
-    {
-        EntitlementValue value(EntitlementValue::Type::String, v);
-        this->values.push_back(value);
-        
-        this->length = this->key.totalLength() + value.totalLength();
-    }
-    
-    EntitlementBlob(std::string key, bool v) : key(EntitlementValue::Type::String, key)
-    {
-        EntitlementValue value(EntitlementValue::Type::Boolean, v ? "\1" : "\0");
-        this->values.push_back(value);
-        
-        this->length = this->key.totalLength() + value.totalLength();
-    }
-    
-    EntitlementBlob(std::string key, std::vector<std::string> values) : key(EntitlementValue::Type::String, key), isArray(true)
-    {
-        int8_t valuesLength = 0;
-        for (auto &value : values)
-        {
-            EntitlementValue entitlementValue(EntitlementValue::Type::String, value);
-            this->values.push_back(entitlementValue);
-            
-            valuesLength += entitlementValue.totalLength();
-        }
-        
-        this->length = this->key.totalLength() + valuesLength + 2; // Arrays require 2 extra bytes.
-    }
-    
-    uint8_t totalLength()
-    {
-        return this->length + 2;
-    }
-    
-    std::string data()
-    {
-        std::stringbuf data;
-        put(data, (char *)&this->padding, 1);
-        put(data, (char *)&this->length, 1);
-        put(data, this->key.data().data(), this->key.totalLength());
-        
-        if (this->isArray)
-        {
-            // Arrays need 2 extra bytes:
-            // - 0x30
-            // - Total length of all values in array (including their 2 byte headers)
-            
-            int8_t padding = 0x30;
-            int8_t length = 0;
-            
-            for (auto &value : this->values)
-            {
-                length += value.totalLength();
-            }
-            
-            put(data, (char *)&padding, 1);
-            put(data, (char *)&length, 1);
-        }
-        
-        for (auto &value : this->values)
-        {
-            put(data, value.data().data(), value.totalLength());
-        }
-        
-        return data.str();
-    }
-    
-private:
-    bool isArray = false;
-};
-
-struct EntitlementsSuperBlob
-{
-    uint32_t magic = CSMAGIC_EMBEDDED_RAW_ENTITLEMENTS;
-    uint32_t length; // Total length, _including_ .magic and .length
-    
-    uint8_t byte1 = 0x31;
-    uint8_t byte2;
-    
-    uint16_t blobsLength;
-    std::vector<EntitlementBlob> blobs;
-    
-    EntitlementsSuperBlob(std::vector<EntitlementBlob> blobs) : blobs(blobs)
-    {
-        uint32_t blobsLength = 0;
-        for (auto &blob : blobs)
-        {
-            blobsLength += blob.totalLength();
-        }
-        
-        this->blobsLength = blobsLength;
-        
-        if (this->blobsLength > UCHAR_MAX)
-        {
-            this->length = blobsLength + 10 + 2; // blobsLength is > 255, so we need 2 bytes to encode it.
-            this->byte2 = 0x82;
-        }
-        else
-        {
-            this->length = blobsLength + 10 + 1; // blobsLength is <= 255, so we only need 1 byte to encode it.
-            this->byte2 = 0x81;
-        }
-    }
-    
-    std::string data()
-    {
-        std::stringbuf data;
-        
-        uint32_t swappedMagic = Swap(this->magic);
-        uint32_t swappedLength = Swap(this->length);
-        
-        put(data, (char *)&swappedMagic, 4);
-        put(data, (char *)&swappedLength, 4);
-        put(data, (char *)&this->byte1, 1);
-        put(data, (char *)&this->byte2, 1);
-        
-        if (this->blobsLength > UCHAR_MAX)
-        {
-            uint32_t swappedBlobsLength = Swap(this->blobsLength);
-            put(data, (char *)&swappedBlobsLength, 2);
-        }
-        else
-        {
-            put(data, (char *)&this->blobsLength, 1);
-        }
-                
-        for (auto &blob : this->blobs)
-        {
-            put(data, blob.data().data(), blob.totalLength());
-        }
-        
-        return data.str();
-    }
-};
-
 struct CodeDirectory {
     uint32_t version;
     uint32_t flags;
@@ -1473,9 +1331,11 @@ static void Allocate(const void *idata, size_t isize, std::streambuf &output, co
 
         if (symtab != NULL) {
             auto end(mach_header.Swap(symtab->stroff) + mach_header.Swap(symtab->strsize));
-            _assert(end <= size);
-            _assert(end >= size - 0x10);
-            size = end;
+            if(symtab->stroff != 0 || symtab->strsize != 0) {
+                _assert(end <= size);
+                _assert(end >= size - 0x10);
+                size = end;
+            }
         }
 
         size_t alloc(allocate(mach_header, size));
@@ -1832,11 +1692,6 @@ class NullBuffer :
     }
 };
 
-class Digest {
-  public:
-    uint8_t sha1_[LDID_SHA1_DIGEST_LENGTH];
-};
-
 class HashBuffer :
     public std::streambuf
 {
@@ -1956,11 +1811,32 @@ namespace ldid {
 static plist_t plist(const std::string &data);
 #endif
 
+struct Baton { // TODO: Add compatibility when libplist isn't available + handle DER to XML conversion
+
+    std::string entitlements_;
+    std::string derformat_;
+    
+    void initWithEntitlement(std::string entitlement) {
+        if(Starts(entitlement, "bplist00")) { /* initilize with DER entitlements */
+            derformat_ = entitlement;
+            _assert(entitlements_.empty()); // -> remove assert after adding compatibility
+        } else { /* initilize with xml entitlements */
+            entitlements_ = entitlement;
+            auto combined(plist(entitlements_));
+            _scope( { plist_free(combined); } );
+            _assert(plist_get_node_type(combined) == PLIST_DICT);
+            derformat_ = der(combined);
+        }
+    }
+};
+
 Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::string &identifier, const std::string &entitlements, const std::string &requirement, const std::string &key, const Slots &slots, const Functor<void (double)> &percent) {
     Hash hash;
 
     std::string team;
-
+    Baton baton;
+    baton.initWithEntitlement(entitlements); /* MARK: assuming for now that imputed entitlements are XML */
+    
 #ifndef LDID_NOSMIME
     if (!key.empty()) {
         Stuff stuff(key);
@@ -2003,17 +1879,19 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
         else
             alloc += requirement.size();
 
-        if (!entitlements.empty()) {
+        if (!baton.entitlements_.empty()) { /* XML entitlements */
             special = std::max(special, CSSLOT_ENTITLEMENTS);
             alloc += sizeof(struct BlobIndex);
             alloc += sizeof(struct Blob);
-            alloc += entitlements.size();
+            alloc += baton.entitlements_.size();
         }
         
-        if (!entitlements.empty())
+        if (!baton.derformat_.empty()) /* DER entitlements */
         {
-            // TODO: Calculate exact amount necessary to embed raw entitlements.
-            alloc += entitlements.length(); // Overestimate
+            special = std::max(special, CSSLOT_ENTITLEMENTS);
+            alloc += sizeof(struct BlobIndex);
+            alloc += sizeof(struct Blob);
+            alloc += baton.derformat_.size();
         }
 
         size_t directory(0);
@@ -2053,7 +1931,7 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
             insert(blobs, CSSLOT_REQUIREMENTS, data);
         }
 
-        if (!entitlements.empty()) {
+        if (!baton.entitlements_.empty()) {
             std::stringbuf data;
             put(data, entitlements.data(), entitlements.size());
             insert(blobs, CSSLOT_ENTITLEMENTS, CSMAGIC_EMBEDDED_ENTITLEMENTS, data);
@@ -2063,16 +1941,9 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
             }
         }
         
-        std::string derFormat;
-        std::string xmlFormat; // TODO: Support importing der entitlements and convert to xml :)
-        auto combined(plist(entitlements));
-        _scope( { plist_free(combined); } );
-        _assert(plist_get_node_type(combined) == PLIST_DICT);
-        derFormat = der(combined);
-        
-        if(!derFormat.empty()) { //MARK: CHECK IF VALID!!!!!
+        if(!baton.derformat_.empty()) {
             std::stringbuf data;
-            put(data, derFormat.data(), derFormat.size());
+            put(data, baton.derformat_.data(), baton.derformat_.size());
             insert(blobs, CSSLOT_RAW_ENTITLEMENTS, CSMAGIC_EMBEDDED_RAW_ENTITLEMENTS, data);
         }
 
@@ -2285,8 +2156,7 @@ void DiskFolder::Find(const std::string &root, const std::string &base, const Fu
 
 void DiskFolder::Save(const std::string &path, bool edit, const void *flag, const Functor<void (std::streambuf &)> &code) {
     if (!edit) {
-        // XXX: use nullbuf
-        std::stringbuf save;
+        NullBuffer save;
         code(save);
     } else {
         std::filebuf save;
@@ -2421,7 +2291,7 @@ static void copy(std::streambuf &source, std::streambuf &target, size_t length, 
 #ifndef LDID_NOPLIST
 static plist_t plist(const std::string &data) {
     if(data.empty())
-        return plist_new_dict(); // fixes crashing issues...
+        return plist_new_dict();
     plist_t plist(NULL);
     if (Starts(data, "bplist00"))
         plist_from_bin(data.data(), data.size(), &plist);
@@ -2548,7 +2418,19 @@ static Hash Sign(const uint8_t *prefix, size_t size, std::streambuf &buffer, Has
     return Sign(data.data(), data.size(), proxy, identifier, entitlements, requirement, key, slots, percent);
 }
 
-Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std::map<std::string, Hash> &remote, const std::string &requirement, const Functor<std::string (const std::string &, const std::string &)> &alter, const Functor<void (const std::string &)> &progress, const Functor<void (double)> &percent) {
+struct State {
+    std::map<std::string, Hash> files;
+    std::map<std::string, std::string> links;
+    
+    void Merge(const std::string &root, const State &state) {
+        for (const auto &entry : state.files)
+            files[root + entry.first] = entry.second;
+        for (const auto &entry : state.links)
+            links[root + entry.first] = entry.second;
+    }
+};
+
+Bundle Sign(const std::string &root, Folder &folder, const std::string &key, State &remote, const std::string &requirement, const Functor<std::string (const std::string &, const std::string &)> &alter, const Functor<void (const std::string &)> &progress, const Functor<void (double)> &percent) {
     std::string executable;
     std::string identifier;
 
@@ -2619,7 +2501,7 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
         rules2.insert(Rule{20, NoMode, "^version\\.plist$"});
     }
 
-    std::map<std::string, Hash> local;
+    State local;
 
     std::string failure(mac ? "Contents/|Versions/[^/]*/Resources/" : "");
     Expression nested("^(Frameworks/[^/]*\\.framework|PlugIns/[^/]*\\.appex(()|/[^/]*.app))/(" + failure + ")Info\\.plist$");
@@ -2633,7 +2515,7 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
         SubFolder subfolder(folder, bundle);
 
         bundles[nested[1]] = Sign(bundle, subfolder, key, local, "", Starts(name, "PlugIns/") ? alter :
-            static_cast<const Functor<std::string (const std::string &, const std::string &)> &>(fun([&](const std::string &, const std::string &entitlements) -> std::string { return entitlements; }))
+            static_cast<const Functor<std::string (const std::string &, const std::string &)> &>(fun([&](const std::string &, const std::string &) -> std::string { return entitlements; }))
         , progress, percent);
     }), fun([&](const std::string &name, const Functor<std::string ()> &read) {
     }));
@@ -2654,15 +2536,13 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
         return false;
     });
 
-    std::map<std::string, std::string> links;
-
     folder.Find("", fun([&](const std::string &name) {
         if (exclude(name))
             return;
 
-        if (local.find(name) != local.end())
+        if (local.files.find(name) != local.files.end())
             return;
-        auto &hash(local[name]);
+        auto &hash(local.files[name]);
 
         folder.Open(name, fun([&](std::streambuf &data, size_t length, const void *flag) {
             progress(root + name);
@@ -2704,7 +2584,7 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
         if (exclude(name))
             return;
 
-        links[name] = read();
+        local.links[name] = read();
     }));
 
     auto plist(plist_new_dict());
@@ -2719,7 +2599,7 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
 
         bool old(&version.second == &rules1);
 
-        for (const auto &hash : local)
+        for (const auto &hash : local.files)
             for (const auto &rule : version.second)
                 if (rule(hash.first)) {
                     if (!old && mac && excludes.find(hash.first) != excludes.end());
@@ -2738,19 +2618,20 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
                     break;
                 }
 
-        for (const auto &link : links)
-            for (const auto &rule : version.second)
-                if (rule(link.first)) {
-                    if (rule.mode_ != OmitMode) {
-                        auto entry(plist_new_dict());
-                        plist_dict_set_item(entry, "symlink", plist_new_string(link.second.c_str()));
-                        if (rule.mode_ == OptionalMode)
-                            plist_dict_set_item(entry, "optional", plist_new_bool(true));
-                        plist_dict_set_item(files, link.first.c_str(), entry);
-                    }
+        if (!old)
+            for(const auto &link : local.links)
+                for (const auto &rule : version.second)
+                    if (rule(link.first)) {
+                        if (rule.mode_ != OmitMode) {
+                            auto entry(plist_new_dict());
+                            plist_dict_set_item(entry, "symlink", plist_new_string(link.second.c_str()));
+                            if (rule.mode_ == OptionalMode)
+                                plist_dict_set_item(entry, "optional", plist_new_bool(true));
+                            plist_dict_set_item(files, link.first.c_str(), entry);
+                        }
 
-                    break;
-                }
+                        break;
+                    }
 
         if (!old && mac)
             for (const auto &bundle : bundles) {
@@ -2801,7 +2682,7 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
     }
 
     folder.Save(signature, true, NULL, fun([&](std::streambuf &save) {
-        HashProxy proxy(local[signature], save);
+        HashProxy proxy(local.files[signature], save);
         char *xml(NULL);
         uint32_t size;
         plist_to_xml(plist, &xml, &size);
@@ -2816,20 +2697,18 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, std
         progress(root + executable);
         folder.Save(executable, true, flag, fun([&](std::streambuf &save) {
             Slots slots;
-            slots[1] = local.at(info);
-            slots[3] = local.at(signature);
-            bundle.hash = Sign(NULL, 0, buffer, local[executable], save, identifier, entitlements, requirement, key, slots, length, percent);
+            slots[1] = local.files.at(info);
+            slots[3] = local.files.at(signature);
+            bundle.hash = Sign(NULL, 0, buffer, local.files[executable], save, identifier, entitlements, requirement, key, slots, length, percent);
         }));
     }));
 
-    for (const auto &entry : local)
-        remote[root + entry.first] = entry.second;
-
+    remote.Merge(root,local);
     return bundle;
 }
 
 Bundle Sign(const std::string &root, Folder &folder, const std::string &key, const std::string &requirement, const Functor<std::string (const std::string &, const std::string &)> &alter, const Functor<void (const std::string &)> &progress, const Functor<void (double)> &percent) {
-    std::map<std::string, Hash> local;
+    State local;
     return Sign(root, folder, key, local, requirement, alter, progress, percent);
 }
 #endif
