@@ -1888,7 +1888,7 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
         
         if (!baton.derformat_.empty()) /* DER entitlements */
         {
-            special = std::max(special, CSSLOT_ENTITLEMENTS);
+            special = std::max(special, CSSLOT_RAW_ENTITLEMENTS);
             alloc += sizeof(struct BlobIndex);
             alloc += sizeof(struct Blob);
             alloc += baton.derformat_.size();
@@ -2515,7 +2515,7 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, Sta
         SubFolder subfolder(folder, bundle);
 
         bundles[nested[1]] = Sign(bundle, subfolder, key, local, "", Starts(name, "PlugIns/") ? alter :
-            static_cast<const Functor<std::string (const std::string &, const std::string &)> &>(fun([&](const std::string &, const std::string &) -> std::string { return entitlements; }))
+            static_cast<const Functor<std::string (const std::string &, const std::string &)> &>(fun([&](const std::string &, const std::string &entitlements) -> std::string { return entitlements; })) //MARK: ^D^ Most likely cause for framework entitlement issues seen with some iPAs
         , progress, percent);
     }), fun([&](const std::string &name, const Functor<std::string ()> &read) {
     }));
@@ -2703,7 +2703,7 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, Sta
         }));
     }));
 
-    remote.Merge(root,local);
+    remote.Merge(root, local);
     return bundle;
 }
 
